@@ -220,10 +220,15 @@ int is_good_password(const struct keepass_data* kd, const char* pass, size_t pas
     AES_cbc_encrypt(kd->payload, plaintext, kd->payload_len, &aes_key, enc_iv_copy, AES_DECRYPT);
 
     // PKCS7 padding
-    const size_t plaintext_len = kd->payload_len - plaintext[kd->payload_len-1];
+    const uint8_t padding = plaintext[kd->payload_len-1];
+    if (key_debug)
+        printf("Padding: %u\n", plaintext[kd->payload_len-1]);
+    if (padding == 0 || padding > 128/8)
+        return 0; // padding > AES block size == decryption error
+
+    const size_t plaintext_len = kd->payload_len - padding;
     if (plaintext_len >= kd->payload_len) {
-        // err(EXIT_FAILURE, "Bad padding - plaintext_len: %zu for payload_len: %zu", plaintext_len, kd->payload_len);
-        return 0;
+        err(EXIT_FAILURE, "Bad padding - plaintext_len: %zu for payload_len: %zu", plaintext_len, kd->payload_len);
     }
 
     uint8_t plaintext_hash[32];

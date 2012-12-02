@@ -1,0 +1,13 @@
+#!/bin/sh
+
+count=$(
+    for f in test-pad/a*.kdb; do
+        echo "a" | ./keebrute $f
+    done | grep -c Good
+)
+if [ $count -eq 16 ]; then
+    echo "OK"
+else
+    echo "FAIL: only $count passwords match"
+    exit 1
+fi
