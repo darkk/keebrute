@@ -1,3 +1,41 @@
+/*
+ * Brute-force application to tests passwords for KeePass kdb files, kdbx are
+ * not supported. Only AES-encrypted files are supported at the moment.
+ * Key-files are not supported, but support for key-files is trivial to add.
+ *
+ * The logic is deducted from file src/format/KeePass1Reader.cpp
+ * (KeepassX-2.0-alpha source code), so it inherits the license:
+ *
+ *  Copyright (C) 2012 Felix Geyer <debfx@fobos.de>
+ *  Copyright (C) 2012 Leonid Evdokimov <leon@darkk.net.ru>
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 2 or (at your option)
+ *  version 3 of the License.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * OpenSSL may be not the fastest AES library for ECB mode (16-bytes block).
+ * See "AES Speed" discussion in openssl-users@:
+ * - http://comments.gmane.org/gmane.comp.encryption.openssl.user/38051
+ * - http://www.mail-archive.com/openssl-users@openssl.org/msg60637.html
+ * OTOH, speed_limit affects only CBC mode, so the claim above may be invalid.
+ *
+ * 63s for 3072 passwords with 50000 rounds and 4400 payload bytes
+ * 1 thread:  48.75 pass/s
+ * 2 threads: 91.34
+ * 3 threads: 93.19
+ * 4 threads: 98.35
+ * These numbers make perfect sence on Intel(R) Core(TM) i7-2620M CPU @ 2.70GHz
+ * with 2 cores (4 CPUs, HT turned on).
+ */
 #include <stdio.h>
 #include <err.h>
 #include <stdlib.h>
@@ -5,6 +43,8 @@
 #include <endian.h>
 #include <assert.h>
 #include <string.h>
+#include <pthread.h>
+#include <sys/time.h>
 #include <openssl/sha.h>
 #include <openssl/aes.h>
 
@@ -191,26 +231,41 @@ int is_good_password(const struct keepass_data* kd, const char* pass, size_t pas
     return (memcmp(plaintext_hash, kd->content_hash, 32) == 0);
 }
 
-int main(int argc, const char* argv[]) {
-    if (argc != 2)
-        errx(EXIT_FAILURE, "Usage: %s <filename>", argv[0]);
+struct shared_state {
+    pthread_mutex_t mtx;
+    const struct keepass_data* kd;
+    int done;
+    unsigned int passcnt;
+};
 
-    struct keepass_data* kd = malloc(sizeof(struct keepass_data));
-    load_keepass(kd, argv[1]);
-
-    printf("Reading passwords from stdin one-per-line...\n");
+void* thread(void* arg)
+{
+    struct shared_state* state = arg;
+    const struct keepass_data *kd = state->kd;
 
     uint8_t passbuf[max_passlen];
     unsigned int passcnt = 0;
     for (;;) {
-        if (!fgets(passbuf, sizeof(passbuf), stdin))
+        pthread_mutex_lock(&state->mtx);
+        char *got = fgets(passbuf, sizeof(passbuf), stdin);
+        if (state->done)
+            got = NULL;
+        pthread_mutex_unlock(&state->mtx);
+
+        if (!got)
             break;
+
         size_t passlen = strlen(passbuf);
         while (passlen > 0 && passbuf[passlen-1] == '\x0d' || passbuf[passlen-1] == '\x0a')
             passlen--;
+
         if (passlen) {
             passcnt++;
             if (is_good_password(kd, passbuf, passlen)) {
+                pthread_mutex_lock(&state->mtx);
+                state->done = 1;
+                pthread_mutex_unlock(&state->mtx);
+
                 printf("Good password: \"");
                 print_oct_blob(stdout, passbuf, passlen);
                 printf("\"\n");
@@ -218,6 +273,47 @@ int main(int argc, const char* argv[]) {
             }
         }
     }
-    printf("%u passwords tested.\n", passcnt);
+
+    pthread_mutex_lock(&state->mtx);
+    state->passcnt += passcnt;
+    pthread_mutex_unlock(&state->mtx);
+
+    return NULL;
+}
+
+int main(int argc, const char* argv[]) {
+    if (argc != 2 && argc != 3)
+        errx(EXIT_FAILURE, "Usage: %s <filename> [thread_count]", argv[0]);
+
+    struct keepass_data* kd = malloc(sizeof(struct keepass_data));
+    load_keepass(kd, argv[1]);
+    const int thread_count = argc == 3 ? atoi(argv[2]) : 1;
+
+    printf("Reading passwords from stdin one-per-line using %d threads...\n", thread_count);
+
+    struct shared_state state;
+    memset(&state, 0, sizeof(state));
+    pthread_mutex_init(&state.mtx, NULL);
+    state.kd = kd;
+
+    struct timeval begin, end, delta;
+    gettimeofday(&begin, NULL);
+
+    pthread_t threads[thread_count];
+    int i;
+    for (i = 0; i < thread_count; i++)
+        if (pthread_create(threads+i, NULL, thread, &state) != 0)
+            err(EXIT_FAILURE, "pthread_create failed");
+    for (i = 0; i < thread_count; i++)
+        if (pthread_join(threads[i], NULL) != 0)
+            err(EXIT_FAILURE, "pthread_join failed");
+
+    gettimeofday(&end, NULL);
+    timersub(&end, &begin, &delta);
+    const uint64_t delta_us = delta.tv_sec * 1000000 + delta.tv_usec;
+    printf("%u passwords tested within %.1f seconds, %.2f passwords per second.\n",
+            state.passcnt,
+            1.0*delta_us/1e6,
+            1e6*state.passcnt/delta_us);
     return 0;
 }
