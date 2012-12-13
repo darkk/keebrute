@@ -37,6 +37,7 @@
  * with 2 cores (4 CPUs, HT turned on).
  */
 #include <stdio.h>
+#include <ctype.h>
 #include <err.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -61,6 +62,8 @@ uint32_t read_le_32(FILE* fd)
 
 void read_blob(FILE* fd, uint8_t* buf, size_t buf_len)
 {
+    if (buf_len == 0)
+        return;
     if (fread(buf, buf_len, 1, fd) != 1)
         err(EXIT_FAILURE, "Can't read value from file");
 }
@@ -84,23 +87,12 @@ void read_magic(FILE* fd)
         errx(EXIT_FAILURE, "Magic number mismatch");
 }
 
-void reader_key(
+void transform_raw_key(
         uint8_t finalKey[32],
-        const uint8_t* pass, const size_t passlen,
+        /*const*/ uint8_t rawKey[32], // in-place transofrmation
         const uint8_t master_seed[16],
         const uint8_t transform_seed[32], uint32_t transform_rounds)
 {
-    uint8_t rawKey[32];
-    SHA256(pass, passlen, rawKey);
-    // if not keyfile:  rawKey = SHA256(password)
-    // if not password: rawKey = derived_sha256(keyfile)
-    // else:            rawKey = SHA256(SHA256(password) || derived_sha256(keyfile))
-    if (key_debug) {
-        printf("rawKey(): ");
-        print_oct_blob(stdout, rawKey, 32);
-        printf("\n");
-    }
-
     AES_KEY aes_key;
     AES_set_encrypt_key(transform_seed, 32*8/*256*/, &aes_key);
 
@@ -134,6 +126,26 @@ void reader_key(
         printf("\n");
     }
 }
+
+void reader_key(
+        uint8_t finalKey[32],
+        const uint8_t* pass, const size_t passlen,
+        const uint8_t master_seed[16],
+        const uint8_t transform_seed[32], uint32_t transform_rounds)
+{
+    uint8_t rawKey[32];
+    SHA256(pass, passlen, rawKey);
+    // if not keyfile:  rawKey = SHA256(password)
+    // if not password: rawKey = derived_sha256(keyfile)
+    // else:            rawKey = SHA256(SHA256(password) || derived_sha256(keyfile))
+    if (key_debug) {
+        printf("rawKey(): ");
+        print_oct_blob(stdout, rawKey, 32);
+        printf("\n");
+    }
+    transform_raw_key(finalKey, rawKey, master_seed, transform_seed, transform_rounds);
+}
+
 
 struct keepass_data {
     uint8_t transform_seed[32];
@@ -205,10 +217,8 @@ void load_keepass(struct keepass_data* kd, const char* fname)
     fclose(fd);
 }
 
-int is_good_password(const struct keepass_data* kd, const char* pass, size_t passlen)
+int is_good_reader_key(const struct keepass_data* kd, const uint8_t finalKey[32])
 {
-    uint8_t finalKey[32];
-    reader_key(finalKey, pass, passlen, kd->master_seed, kd->transform_seed, kd->transform_rounds);
 
     AES_KEY aes_key;
     AES_set_decrypt_key(finalKey, 32*8, &aes_key);
@@ -236,6 +246,13 @@ int is_good_password(const struct keepass_data* kd, const char* pass, size_t pas
     return (memcmp(plaintext_hash, kd->content_hash, 32) == 0);
 }
 
+int is_good_password(const struct keepass_data* kd, const uint8_t* pass, size_t passlen)
+{
+    uint8_t finalKey[32];
+    reader_key(finalKey, pass, passlen, kd->master_seed, kd->transform_seed, kd->transform_rounds);
+    return is_good_reader_key(kd, finalKey);
+}
+
 struct shared_state {
     pthread_mutex_t mtx;
     const struct keepass_data* kd;
@@ -252,7 +269,7 @@ void* thread(void* arg)
     unsigned int passcnt = 0;
     for (;;) {
         pthread_mutex_lock(&state->mtx);
-        char *got = fgets(passbuf, sizeof(passbuf), stdin);
+        char *got = fgets((char*)passbuf, sizeof(passbuf), stdin);
         if (state->done)
             got = NULL;
         pthread_mutex_unlock(&state->mtx);
@@ -260,8 +277,8 @@ void* thread(void* arg)
         if (!got)
             break;
 
-        size_t passlen = strlen(passbuf);
-        while (passlen > 0 && passbuf[passlen-1] == '\x0d' || passbuf[passlen-1] == '\x0a')
+        size_t passlen = strlen((char*)passbuf);
+        while (passlen > 0 && (passbuf[passlen-1] == '\x0d' || passbuf[passlen-1] == '\x0a'))
             passlen--;
 
         if (passlen) {
