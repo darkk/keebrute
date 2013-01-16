@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <err.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <endian.h>
@@ -66,6 +67,12 @@ void read_blob(FILE* fd, uint8_t* buf, size_t buf_len)
         return;
     if (fread(buf, buf_len, 1, fd) != 1)
         err(EXIT_FAILURE, "Can't read value from file");
+}
+
+void write_blob(FILE* fd, const uint8_t* buf, size_t buf_len)
+{
+    if (fwrite(buf, buf_len, 1, fd) != 1)
+        err(EXIT_FAILURE, "Can't write value to file");
 }
 
 void print_oct_blob(FILE* fd, const uint8_t* buf, size_t buf_len)
@@ -127,6 +134,16 @@ void transform_raw_key(
     }
 }
 
+void pass_to_raw_key(
+        uint8_t rawKey[32],
+        const uint8_t* pass, const size_t passlen)
+{
+    // if not keyfile:  rawKey = SHA256(password)
+    // if not password: rawKey = derived_sha256(keyfile)
+    // else:            rawKey = SHA256(SHA256(password) || derived_sha256(keyfile))
+    SHA256(pass, passlen, rawKey);
+}
+
 void reader_key(
         uint8_t finalKey[32],
         const uint8_t* pass, const size_t passlen,
@@ -134,10 +151,7 @@ void reader_key(
         const uint8_t transform_seed[32], uint32_t transform_rounds)
 {
     uint8_t rawKey[32];
-    SHA256(pass, passlen, rawKey);
-    // if not keyfile:  rawKey = SHA256(password)
-    // if not password: rawKey = derived_sha256(keyfile)
-    // else:            rawKey = SHA256(SHA256(password) || derived_sha256(keyfile))
+    pass_to_raw_key(rawKey, pass, passlen);
     if (key_debug) {
         printf("rawKey(): ");
         print_oct_blob(stdout, rawKey, 32);
@@ -160,6 +174,8 @@ struct keepass_data {
 void load_keepass(struct keepass_data* kd, const char* fname)
 {
     FILE* fd = fopen(fname, "rb");
+    if (!fd)
+        errx(EXIT_FAILURE, "Can't open %s", fname);
 
     read_magic(fd);
 
@@ -253,45 +269,98 @@ int is_good_password(const struct keepass_data* kd, const uint8_t* pass, size_t 
     return is_good_reader_key(kd, finalKey);
 }
 
+enum brutemode {
+    pass_2_check,
+    pass_2_rawKey,
+    rawKey_2_finalKey,
+    finalKey_2_check,
+};
+
 struct shared_state {
     pthread_mutex_t mtx;
     const struct keepass_data* kd;
     int done;
     unsigned int passcnt;
+    enum brutemode mode;
+    const char* out_fname;
+    FILE* out;
 };
+
+void open_out(struct shared_state* state)
+{
+    if (!state->out) {
+        state->out = fopen(state->out_fname, "wb");
+        if (!state->out)
+            errx(EXIT_FAILURE, "Can't open %s", state->out_fname);
+    }
+}
 
 void* thread(void* arg)
 {
     struct shared_state* state = arg;
     const struct keepass_data *kd = state->kd;
+    const enum brutemode mode = state->mode;
 
     uint8_t passbuf[max_passlen];
     unsigned int passcnt = 0;
     for (;;) {
         pthread_mutex_lock(&state->mtx);
-        char *got = fgets((char*)passbuf, sizeof(passbuf), stdin);
-        if (state->done)
-            got = NULL;
+        char *got = NULL;
+        if (!state->done) {
+            if (mode == pass_2_check || mode == pass_2_rawKey)
+                got = fgets((char*)passbuf, sizeof(passbuf), stdin);
+            else
+                got = (fread(passbuf, 32, 1, stdin) == 1) ? (char*)passbuf : NULL;
+        }
         pthread_mutex_unlock(&state->mtx);
 
         if (!got)
             break;
 
-        size_t passlen = strlen((char*)passbuf);
-        while (passlen > 0 && (passbuf[passlen-1] == '\x0d' || passbuf[passlen-1] == '\x0a'))
-            passlen--;
+        size_t passlen;
+        if (mode == pass_2_check || mode == pass_2_rawKey) {
+           passlen = strlen((char*)passbuf);
+            while (passlen > 0 && (passbuf[passlen-1] == '\x0d' || passbuf[passlen-1] == '\x0a'))
+                passlen--;
+        }
+        else {
+            passlen = 32;
+        }
 
         if (passlen) {
             passcnt++;
-            if (is_good_password(kd, passbuf, passlen)) {
-                pthread_mutex_lock(&state->mtx);
-                state->done = 1;
-                pthread_mutex_unlock(&state->mtx);
+            if (mode == pass_2_check || mode == finalKey_2_check) {
+                const int success =
+                    (mode == pass_2_check)
+                        ? is_good_password(kd, passbuf, passlen)
+                        : is_good_reader_key(kd, passbuf);
+                if (success) {
+                    pthread_mutex_lock(&state->mtx);
+                    state->done = 1;
+                    pthread_mutex_unlock(&state->mtx);
 
-                printf("Good password: \"");
-                print_oct_blob(stdout, passbuf, passlen);
-                printf("\"\n");
-                break;
+                    printf("Good password: \"");
+                    print_oct_blob(stdout, passbuf, passlen);
+                    if (state->out_fname) {
+                        open_out(state);
+                        write_blob(state->out, passbuf, passlen);
+                    }
+                    printf("\"\n");
+                    break;
+                }
+            }
+            else {
+                uint8_t key[32];
+
+                if (mode == pass_2_rawKey)
+                    pass_to_raw_key(key, passbuf, passlen);
+                else
+                    transform_raw_key(key, passbuf, kd->master_seed, kd->transform_seed, kd->transform_rounds);
+
+                pthread_mutex_lock(&state->mtx);
+                open_out(state);
+                write_blob(state->out, key, sizeof(key));
+                pthread_mutex_unlock(&state->mtx);
             }
         }
     }
@@ -304,12 +373,18 @@ void* thread(void* arg)
 }
 
 int main(int argc, const char* argv[]) {
-    if (argc != 2 && argc != 3)
-        errx(EXIT_FAILURE, "Usage: %s <filename> [thread_count]", argv[0]);
+    if (argc < 2 || argc > 5)
+        errx(EXIT_FAILURE, "Usage: %s <filename> [thread_count] [output] [pass_2_check|pass_2_rawKey|rawKey_2_finalKey|finalKey_2_check]", argv[0]);
 
     struct keepass_data* kd = malloc(sizeof(struct keepass_data));
     load_keepass(kd, argv[1]);
-    const int thread_count = argc == 3 ? atoi(argv[2]) : 1;
+    const int thread_count = argc >= 3
+        ? (atoi(argv[2]) > 0
+            ? atoi(argv[2])
+            : sysconf(_SC_NPROCESSORS_ONLN))
+        : 1;
+    const char* out_fname = argc >= 4 ? argv[3] : NULL;
+    const char* mode_str = argc >= 5 ? argv[4] : "pass_2_check";
 
     printf("Reading passwords from stdin one-per-line using %d threads...\n", thread_count);
 
@@ -317,6 +392,18 @@ int main(int argc, const char* argv[]) {
     memset(&state, 0, sizeof(state));
     pthread_mutex_init(&state.mtx, NULL);
     state.kd = kd;
+    state.out_fname = out_fname;
+
+    if (strcmp(mode_str, "pass_2_check") == 0) state.mode = pass_2_check;
+    else if (strcmp(mode_str, "pass_2_rawKey") == 0) state.mode = pass_2_rawKey;
+    else if (strcmp(mode_str, "rawKey_2_finalKey") == 0) state.mode = rawKey_2_finalKey;
+    else if (strcmp(mode_str, "finalKey_2_check") == 0) state.mode = finalKey_2_check;
+    else
+        err(EXIT_FAILURE, "Bad mode string: %s", mode_str);
+
+    if (state.mode == pass_2_rawKey || state.mode == rawKey_2_finalKey)
+        if (!out_fname)
+            err(EXIT_FAILURE, "Output filename is mandatory for this mode");
 
     struct timeval begin, end, delta;
     gettimeofday(&begin, NULL);
@@ -329,6 +416,9 @@ int main(int argc, const char* argv[]) {
     for (i = 0; i < thread_count; i++)
         if (pthread_join(threads[i], NULL) != 0)
             err(EXIT_FAILURE, "pthread_join failed");
+
+    if (state.out)
+        fclose(state.out);
 
     gettimeofday(&end, NULL);
     timersub(&end, &begin, &delta);
