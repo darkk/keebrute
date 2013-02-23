@@ -3,9 +3,13 @@
 count=$(
     for f in test-pad/a*.kdb; do
         echo "a" | ./keebrute $f
+        echo "a" | ./keebrute $f 1 test.rawKey pass_2_rawKey && \
+            ./keebrute $f 1 test.finalKey rawKey_2_finalKey < test.rawKey && \
+            ./keebrute $f 1 test.password finalKey_2_check < test.finalKey
+        rm -f test.rawKey test.finalKey test.password
     done | grep -c Good
 )
-if [ $count -eq 16 ]; then
+if [ $count -eq 32 ]; then
     echo "OK"
 else
     echo "FAIL: only $count passwords match"
