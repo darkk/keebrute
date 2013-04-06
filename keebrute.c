@@ -35,6 +35,10 @@
  * 4 threads: 98.35
  * These numbers make perfect sence on Intel(R) Core(TM) i7-2620M CPU @ 2.70GHz
  * with 2 cores (4 CPUs, HT turned on).
+ *
+ * NB: any mode of operation (pass_2_rawKey, rawKey_2_finalKey,
+ * finalKey_2_check, pass_2_check) can shuffle output a bit because of
+ * multithreaded manner, there is no FIFO guarantee.
  */
 #include <stdio.h>
 #include <ctype.h>
@@ -319,7 +323,7 @@ void* thread(void* arg)
 
         size_t passlen;
         if (mode == pass_2_check || mode == pass_2_rawKey) {
-           passlen = strlen((char*)passbuf);
+            passlen = strlen((char*)passbuf);
             while (passlen > 0 && (passbuf[passlen-1] == '\x0d' || passbuf[passlen-1] == '\x0a'))
                 passlen--;
         }
@@ -337,14 +341,14 @@ void* thread(void* arg)
                 if (success) {
                     pthread_mutex_lock(&state->mtx);
                     state->done = 1;
-                    pthread_mutex_unlock(&state->mtx);
-
-                    printf("Good password: \"");
-                    print_oct_blob(stdout, passbuf, passlen);
                     if (state->out_fname) {
                         open_out(state);
                         write_blob(state->out, passbuf, passlen);
                     }
+                    pthread_mutex_unlock(&state->mtx);
+
+                    printf("Good password: \"");
+                    print_oct_blob(stdout, passbuf, passlen);
                     printf("\"\n");
                     break;
                 }
